@@ -25,3 +25,9 @@ var/
 # virtual environment
 .myenv
 .venv
+
+# TO BE REMOVED:
+tools/
+mlx_qwen3_vl_a22b_q4_mlx
+mlx_qwen3_vl_a22b_q4
+_tok_q3vl

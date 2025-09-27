@@ -10,6 +10,7 @@ from .vision import Qwen3Vision
 # text decoder: reuse Qwen3 / Qwen3-MoE from mlx-lm
 from mlx_lm.models import qwen3 as qwen3_dense
 from mlx_lm.models import qwen3_moe as qwen3_moe
+from mlx_vlm.utils import skip_multimodal_module
 
 def _embed_tokens(lang_model: nn.Module, input_ids: mx.array) -> mx.array:
     """
@@ -93,76 +94,93 @@ class Qwen3VL(nn.Module):
     def __init__(self, cfg: Qwen3VLConfig):
         super().__init__()
         self.cfg = cfg
+
         # ---- vision ----
         self.vision = Qwen3Vision(cfg.vision_config)
         vdim = int(cfg.vision_config.get("hidden_size", 1024))
-        tdim = int(cfg.text_config.get("hidden_size", 4096))
-        self.projector = nn.Linear(vdim, tdim, bias=True)  # if HF exposes explicit projector, your converter will map it here
+        self.tdim = int(cfg.text_config.get("hidden_size", 4096))
+        self.projector = nn.Linear(vdim, self.tdim, bias=True)
+        print(f"WHETHER MOE ----> {cfg.model_type}")
+
         # ---- decoder ----
-        # tcfg = dict(cfg.text_config)
-        # required = {
-        #        "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
-        #        "num_attention_heads", "num_experts", "num_experts_per_tok",
-        #        "decoder_sparse_step", "mlp_only_layers", "moe_intermediate_size",
-        #        "rms_norm_eps", "vocab_size", "num_key_value_heads", "head_dim",
-        #        "rope_theta", "max_position_embeddings", "norm_topk_prob",
-        #        # common extras that often matter:
-        #        "rope_scaling", "rope_traditional",
-        # }
-
-        # raw = getattr(cfg, "raw_config", None) or {}
-        # for k in required:
-        #     if k not in tcfg and k in raw:
-        #         tcfg[k] = raw[k]
-        # # Also pick from raw["text_config"] if present (defensive)
-        # raw_text = (raw.get("text_config") or {}) if isinstance(raw, dict) else {}
-        # for k in required:
-        #     if k not in tcfg and k in raw_text:
-        #         tcfg[k] = raw_text[k]
-        # tcfg.setdefault("tie_word_embeddings", False)
-        # tcfg.setdefault("mlp_only_layers", [])
-        # if "moe" in cfg.model_type:
-        #     targs = qwen3_moe.ModelArgs.from_dict(tcfg)
-        #     self.decoder = qwen3_moe.Model(targs)
-        # else:
-        #     targs = qwen3_dense.ModelArgs.from_dict(tcfg)
-        #     self.decoder = qwen3_dense.Model(targs)
-        #   # token ids
-        
-        # # ----- expose submodules under language_model.model.* so keys match HF -----
-        # lm_core = self.decoder.model  # inner core that has .layers, etc.
-
-        # # 1) Visual tower
-        # # keep your own attributes for convenience...
-        # self.visual = self.vision
-        # # ...but also attach to the decoder core so names become language_model.model.visual.*
-        # lm_core.visual = self.visual
-
-        # # 2) Projector (visual -> text)
-        # # HF usually places this under mm_projector.* ; map ours there
-        # lm_core.mm_projector = self.projector
-
-        # # 3) Final norm and LM head (HF expects these on the core)
-        # lm_core.norm = nn.RMSNorm(tdim, eps=float(self.cfg.text_config.get("rms_norm_eps", 1e-6)))
-        # lm_core.lm_head = nn.Linear(
-        #     tdim, int(self.cfg.text_config.get("vocab_size", 32000)), bias=False
-        # )
-
-        # self.vision_start_id = cfg.vision_start_token_id
-        # self.vision_end_id = cfg.vision_end_token_id
-        # self.vision_token_id = cfg.vision_token_id
-        
         if "moe" in cfg.model_type:
             targs = qwen3_moe.ModelArgs.from_dict(cfg.text_config)
             self.decoder = qwen3_moe.Model(targs)
         else:
             targs = qwen3_dense.ModelArgs.from_dict(cfg.text_config)
             self.decoder = qwen3_dense.Model(targs)
-        # token ids
+
+        # ----- TIE LM HEAD TO EMBEDDINGS -----
+        dec  = self.decoder
+        core = getattr(dec, "model", dec)
+        vocab  = int(cfg.text_config.get("vocab_size"))
+        hidden = int(cfg.text_config.get("hidden_size"))
+
+        # locate embeddings
+        emb = getattr(core, "embed_tokens", None) or getattr(core, "tok_embeddings", None)
+        if emb is None:
+            raise RuntimeError("Cannot locate token embedding module on Qwen3 decoder.")
+
+        # ensure a head exists and is correctly shaped
+        need_head = (not hasattr(dec, "lm_head"))
+        if not need_head:
+            try:
+                need_head = tuple(dec.lm_head.weight.shape) != (vocab, hidden)
+            except Exception:
+                need_head = True
+        if need_head:
+            dec.lm_head = nn.Linear(hidden, vocab, bias=False)
+
+        # TIE: use the SAME Parameter object
+        dec.lm_head.weight = emb.weight
+
+        # mirror to core so both access paths work
+        if hasattr(dec, "model"):
+            dec.model.lm_head = dec.lm_head
+
+        # sanity prints AFTER the tie
+        print("tied?", dec.lm_head.weight is emb.weight)
+        print("embed class:", type(emb).__name__)
+        print("head  class:", type(dec.lm_head).__name__)
+
+        # ---- token ids ----
         self.vision_start_id = cfg.vision_start_token_id
         self.vision_end_id = cfg.vision_end_token_id
         self.vision_token_id = cfg.vision_token_id
 
+        # ---- optional decoder-only quantization (do NOT quantize tied tensors) ----
+        quant = {}
+        raw_cfg = getattr(cfg, "raw_config", None) or {}
+        if isinstance(raw_cfg, dict):
+            quant = raw_cfg.get("quantization") or {}
+        if not quant and isinstance(cfg.text_config, dict):
+            quant = cfg.text_config.get("quantization") or {}
+
+        if quant:
+            q_bits = int(quant.get("bits", 4))
+            q_group_size = int(quant.get("group_size", 64))
+
+            def _pred(path, module, *_):
+                # Skip the tied head and embeddings
+                if ("lm_head" in path or
+                    ".embed_tokens" in path or
+                    ".tok_embeddings" in path):
+                    return False
+                if not hasattr(module, "to_quantized"):
+                    return False
+                if skip_multimodal_module(path):
+                    return False
+                if not (path.startswith("decoder.") or ".decoder." in path):
+                    return False
+                try:
+                    return (module.weight.shape[1] % q_group_size == 0) and {
+                        "group_size": q_group_size,
+                        "bits": q_bits,
+                    }
+                except Exception:
+                    return False
+
+            nn.quantize(self, class_predicate=_pred)
 
     # ----- helpers -----
     def encode_images(self, images: List[mx.array]) -> mx.array:
@@ -192,21 +210,45 @@ class Qwen3VL(nn.Module):
             )
             return self.decoder(None, input_embeddings=x, mask=mask, cache=cache)
         else:
-            # pure text
             if input_embeddings is not None:
                 return self.decoder(None, input_embeddings=input_embeddings, mask=attention_mask, cache=cache)
             return self.decoder(input_ids, mask=attention_mask, cache=cache)
 
-    # expose layers (nice for generation utils)
     @property
     def layers(self):
         return self.decoder.model.layers
     
+    def ensure_block_count(self, n: int):
+        """Grow vision.blocks to length n."""
+        cur = len(self.blocks)
+        if n <= cur:
+            return
+        dim   = self.norm.normalized_shape[0]          # same hidden dim
+        heads = getattr(self, "_num_heads", None) or 16
+        mlp_r = getattr(self, "_mlp_ratio", None) or 4.0
+        qkv_b = True
+        # remember some init values on first call
+        self._num_heads  = heads
+        self._mlp_ratio  = mlp_r
+        for _ in range(cur, n):
+            self.blocks.append(Block(dim, heads, mlp_r, qkv_b))
+
+    def ensure_deepstack_count(self, n: int):
+        """Grow vision.deepstack_merger_list to length n."""
+        cur = len(self.deepstack_merger_list)
+        if n <= cur:
+            return
+        dim = self.norm.normalized_shape[0]
+        for _ in range(cur, n):
+            self.deepstack_merger_list.append(DeepStackMerger(dim))
+
+    # ---------------- weight loading (key remap + head-shape guard) ----------------
     def load_weights(self, items, strict: bool = True):
         dec = getattr(self.decoder, "model", self.decoder)
         has_tok_emb = hasattr(dec, "tok_embeddings")
         has_embed_tokens = hasattr(dec, "embed_tokens")
 
+        # --- remap as you already do ---
         def remap(name: str) -> str:
             if name.startswith("model.language_model."):
                 return "decoder.model." + name[len("model.language_model."):]
@@ -222,6 +264,8 @@ class Qwen3VL(nn.Module):
                 return "projector." + name[len("model.mm_projector."):]
             if name.startswith("mm_projector."):
                 return "projector." + name[len("mm_projector."):]
+            if name.startswith("lm_head."):
+                return "SKIP.LM_HEAD"
             return name
 
         def maybe_canonicalize(rk: str) -> str:
@@ -231,14 +275,15 @@ class Qwen3VL(nn.Module):
                 return rk.replace("decoder.norm.", "decoder.model.norm.")
             return rk
 
-        # --- first pass: remap & find max indices to size lists correctly ---
-        max_blk = -1
-        max_ds  = -1
+        # --- pass 1: remap and find maximum vision indices we must support
         remapped = []
+        max_blk  = -1
+        max_ds   = -1
         for k, v in items:
             rk = maybe_canonicalize(remap(k))
+            if rk == "SKIP.LM_HEAD":
+                continue
             remapped.append((rk, v))
-            # track largest indices we will touch
             if rk.startswith("vision.blocks."):
                 parts = rk.split(".")
                 if len(parts) > 2 and parts[2].isdigit():
@@ -248,18 +293,56 @@ class Qwen3VL(nn.Module):
                 if len(parts) > 2 and parts[2].isdigit():
                     max_ds = max(max_ds, int(parts[2]))
 
+        # --- grow vision lists *before* any update so indices exist
         if max_blk >= 0:
             self.vision.ensure_block_count(max_blk + 1)
         if max_ds >= 0:
             self.vision.ensure_deepstack_count(max_ds + 1)
 
-        # --- second pass: filter out obvious non-owned params; let MLX ignore the rest (strict=False) ---
+        # --- pass 2: shape-guard for quantized tensors on attention proj (your recent filter)
+        H  = int(self.cfg.text_config.get("hidden_size", 4096))
+        KV = int(self.cfg.text_config.get("num_key_value_heads", 4)) * int(self.cfg.text_config.get("head_dim", 128))
+        GS = 64
+
+        def is_qw(n): return n.endswith(".qweight")
+        def is_sc(n): return n.endswith(".scales")
+        def is_ze(n): return n.endswith(".zeros")
+        def expect_ok(name: str, arr) -> bool:
+            shape = tuple(getattr(arr, "shape", ()))
+            if is_qw(name):
+                if ".self_attn.q_proj." in name: return shape == (H,  H // 8)
+                if ".self_attn.k_proj." in name: return shape == (KV, H // 8)
+                if ".self_attn.v_proj." in name: return shape == (KV, H // 8)
+            if is_sc(name) or is_ze(name):
+                if ".self_attn.q_proj." in name: return shape == (H,  H // GS)
+                if ".self_attn.k_proj." in name: return shape == (KV, H // GS)
+                if ".self_attn.v_proj." in name: return shape == (KV, H // GS)
+            return True
+
         filtered = []
+        dropped  = 0
         for rk, v in remapped:
-            # toss known non-param blobs if any (rare)
             if rk.endswith(".wpe") or rk.endswith(".rope.freqs"):
                 continue
-            # keep all remapped params; MLX will skip unknowns when strict=False
+            if (".self_attn." in rk) and (is_qw(rk) or is_sc(rk) or is_ze(rk)):
+                if not expect_ok(rk, v):
+                    dropped += 1
+                    continue
+            if rk.startswith("decoder.lm_head."):
+                continue
             filtered.append((rk, v))
+
+        if dropped:
+            print(f"[q3vl] dropped {dropped} mismatched quant tensors (bad shapes)")
+
+        # --- optional: quantize only where qweight exists to avoid double-quant
+        qprefix = {rk[:-9] for rk, _ in filtered if rk.endswith(".qweight")}
+        def _quant_pred(path, module, *_):
+            if ("lm_head" in path) or (".embed_tokens" in path) or (".tok_embeddings" in path):
+                return False
+            return isinstance(module, nn.Linear) and (path in qprefix)
+
+        if qprefix:
+            nn.quantize(self, class_predicate=_quant_pred)
 
         return super().load_weights(filtered, strict=False)

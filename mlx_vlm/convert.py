@@ -3,6 +3,9 @@ import glob
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
+import zipfile
+import io
+import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,7 +17,7 @@ from .utils import (
     fetch_from_hub,
     get_model_path,
     save_config,
-    save_weights,
+    save_weights as save_mlx_weights,
     skip_multimodal_module,
     upload_to_hub,
 )
@@ -28,7 +31,21 @@ QUANT_RECIPES = [
     "mixed_4_6",
     "mixed_4_8",
 ]
-
+def _mx_to_numpy_dtype(mx_dtype):
+    # explicit dtype map; extend if you see new types
+    if mx_dtype == mx.float32:   return np.float32
+    if mx_dtype == mx.float16:   return np.float16
+    # NumPy supports bfloat16 on recent versions; fall back to uint16 if not.
+    if mx_dtype == mx.bfloat16:  return getattr(np, "bfloat16", np.uint16)
+    if mx_dtype == mx.int8:      return np.int8
+    if mx_dtype == mx.uint8:     return np.uint8
+    if mx_dtype == mx.int16:     return np.int16
+    if mx_dtype == mx.uint16:    return np.uint16
+    if mx_dtype == mx.int32:     return np.int32
+    if mx_dtype == mx.uint32:    return np.uint32
+    if mx_dtype == mx.bool_:     return np.bool_
+    # Last resort: store as float16 to keep file usable
+    return np.float16
 
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
@@ -167,7 +184,7 @@ def convert(
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
 
-    save_weights(mlx_path, model, donate_weights=True)
+    save_mlx_weights(mlx_path, model)
 
     # Copy Python and JSON files from the model path to the MLX path
     for pattern in ["*.py", "*.json"]:
