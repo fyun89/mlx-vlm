@@ -1,9 +1,80 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
+from typing import Dict, Any
 
 # ---- Vision building blocks (ViT + DeepStack mergers) ----
+@dataclass
+class Qwen3VLConfig:
+    model_type: str
+    text_config: Dict[str, Any]
+    vision_config: Dict[str, Any]
+    vision_start_token_id: int
+    vision_end_token_id: int
+    vision_token_id: int
+    image_token_id: Optional[int] = None
+    tokenizer_chat_template: Optional[str] = None
+    raw_config: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_hf_config(cls, cfg: Dict[str, Any]) -> "Qwen3VLConfig":
+        mt = (cfg.get("model_type") or "qwen3_vl").lower()
+        tcfg = dict(cfg.get("text_config") or {})
+        vcfg = cfg.get("vision_config") or {}
+
+        def pick(*keys):
+            for k in keys:
+                for src in (cfg, tcfg, vcfg):
+                    if k in src and src[k] is not None:
+                        return src[k]
+            return None
+
+        vst = pick("vision_start_token_id")
+        ved = pick("vision_end_token_id")
+        vti = pick("vision_token_id", "image_token_id")  # some dumps use vision_token_id
+        iti = pick("image_token_id")
+        tmpl = pick("tokenizer_chat_template")
+
+        if any(x is None for x in (vst, ved, vti)):
+            raise ValueError("Qwen3-VL: missing required vision token ids.")
+        
+        required = {
+            "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
+            "num_attention_heads", "num_experts", "num_experts_per_tok",
+            "decoder_sparse_step", "mlp_only_layers", "moe_intermediate_size",
+            "rms_norm_eps", "vocab_size", "num_key_value_heads", "head_dim",
+            "rope_theta", "max_position_embeddings", "norm_topk_prob",
+            # common extras some dumps rely on:
+            "rope_scaling", "rope_traditional",
+        }
+
+        for k in required:
+            if k not in tcfg and k in cfg:
+                tcfg[k] = cfg[k]
+        # safe defaults frequently missing
+        tcfg.setdefault("tie_word_embeddings", False)
+        tcfg.setdefault("mlp_only_layers", [])
+
+
+        if any(x is None for x in (vst, ved, vti)):
+            raise ValueError("Qwen3-VL: missing required vision token ids.")
+
+        return cls(
+            model_type=mt,
+            text_config=tcfg,
+            vision_config=vcfg,
+            vision_start_token_id=int(vst),
+            vision_end_token_id=int(ved),
+            vision_token_id=int(vti),
+            image_token_id=int(iti) if iti is not None else None,
+            tokenizer_chat_template=tmpl,
+            raw_config=cfg
+        )
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]) -> "Qwen3VLConfig":
+        return cls.from_hf_config(cfg)
 
 class PatchEmbed(nn.Module):
     def __init__(self, in_chans: int, embed_dim: int, patch_size: int):
@@ -127,3 +198,40 @@ class Qwen3Vision(nn.Module):
             x = m(x)
         x = self.merger(x)
         return x  # [B, T_img, dim]
+    
+
+class TextConfig(dict):
+    """
+    Dict-like text subconfig that merges required fields from the full HF cfg.
+    Keeps a reference to raw cfg for any later backfill, but returns a *self-contained* dict.
+    """
+    def __init__(self, *args, raw: Optional[Dict[str, Any]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raw = raw
+
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]):
+        merged = dict(cfg.get("text_config") or {})
+        required = {
+            "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
+            "num_attention_heads", "num_experts", "num_experts_per_tok",
+            "decoder_sparse_step", "mlp_only_layers", "moe_intermediate_size",
+            "rms_norm_eps", "vocab_size", "num_key_value_heads", "head_dim",
+            "rope_theta", "max_position_embeddings", "norm_topk_prob",
+            "rope_scaling", "rope_traditional",
+        }
+        # fill from top-level
+        for k in required:
+            if k not in merged and k in cfg:
+                merged[k] = cfg[k]
+        # safe defaults
+        merged.setdefault("tie_word_embeddings", False)
+        merged.setdefault("mlp_only_layers", [])
+        return cls(merged, raw=cfg)
+
+class VisionConfig(dict):
+    """Thin wrapper for the vision subconfig."""
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]):
+        # accepts full HF cfg; return just the vision_config dict
+        return cls(cfg.get("vision_config") or {})

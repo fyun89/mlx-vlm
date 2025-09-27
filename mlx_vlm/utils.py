@@ -40,7 +40,6 @@ MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
-
 def skip_multimodal_module(path: str) -> bool:
     """
     Check if a multimodal module (vision/audio) should skip quantization.
